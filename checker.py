@@ -1,292 +1,372 @@
 """
-checker.py - 교육과정 편성 자율점검표 21개 항목 점검
+교육과정 편성 자율점검표 (21개 항목) 자동 점검 로직
 """
-from typing import Dict, List, Any, Optional
-from db import SUBJECT_DB, HIERARCHY_PAIRS, lookup, normalize_name
-
-
-STATUS_PASS = "PASS"
-STATUS_FAIL = "FAIL"
-STATUS_CHECK = "CHECK"
-STATUS_MANUAL = "MANUAL"
-STATUS_NA = "N/A"
+from __future__ import annotations
+from collections import defaultdict
+from db import (
+    SUBJECT_DB, HIERARCHY_PAIRS, BASIC_GROUPS,
+    T_COMMON, T_GENERAL, T_CAREER, T_CONVERGENCE, T_SPECIAL,
+    G_KOR, G_MAT, G_ENG, G_SOC, G_SCI, G_PE, G_ART, G_TI, G_FL, G_LIB,
+)
 
 
 class CurriculumChecker:
-    def __init__(self, parsed: Dict[str, Any]):
+    def __init__(self, parsed: dict):
         self.parsed = parsed
         self.subjects = parsed.get("subjects", [])
-        self.summary = parsed.get("summary", [])
+        self.summary = parsed.get("summary_rows", [])
         self.notes = parsed.get("notes", [])
-        self.meta = parsed.get("meta", {})
-        self.sem_labels = parsed.get("semester_labels", ["1-1","1-2","2-1","2-2","3-1","3-2"])
-        self.results: List[Dict[str, Any]] = []
+        self.semester_labels = parsed.get("semester_labels", [])
+        self.meta = parsed.get("메타데이터", {})
+        self._results: list[dict] = []
 
-    # ---------- helpers ----------
-    def _add(self, code, name, status, detail):
-        self.results.append({
-            "코드": code, "점검항목": name, "상태": status, "상세": detail
+    # ---------- 공통 헬퍼 ----------
+    def _total_subject_credits(self) -> float:
+        """교과 총 운영학점 (창체 제외)"""
+        return sum(s.get("운영학점", 0) for s in self.subjects)
+
+    def _required_credits(self) -> float:
+        """필수 이수 학점 합계"""
+        return sum(s.get("필수이수학점", 0) for s in self.subjects)
+
+    def _ca_credits(self) -> float:
+        """창의적 체험활동 학점"""
+        for s in self.summary:
+            nm = str(s.get("과목명", ""))
+            if "창의적 체험활동" in nm or "창체" in nm:
+                return s.get("운영학점", 0) or s.get("학기합계", 0)
+        return 0.0
+
+    def _semester_totals(self) -> dict[str, float]:
+        """학기별 총 학점"""
+        totals = defaultdict(float)
+        for s in self.subjects:
+            for lbl, v in s.get("학기별학점", {}).items():
+                totals[lbl] += v
+        return dict(totals)
+
+    def _group_totals(self) -> dict[str, float]:
+        """교과군별 운영학점 (DB 기준)"""
+        totals = defaultdict(float)
+        for s in self.subjects:
+            info = SUBJECT_DB.get(s["과목명"])
+            if info:
+                totals[info[0]] += s.get("운영학점", 0)
+            else:
+                grp = s.get("교과군") or ""
+                if grp:
+                    totals[str(grp).strip()] += s.get("운영학점", 0)
+        return dict(totals)
+
+    def _add(self, code: str, name: str, status: str, message: str, detail: str = ""):
+        self._results.append({
+            "코드": code, "점검항목": name, "상태": status,
+            "결과": message, "상세": detail,
         })
 
-    def _subjects_credit(self) -> float:
-        return sum((s.get("운영학점") or 0) for s in self.subjects)
-
-    def _ca_credit(self) -> Optional[float]:
-        # summary에서 '창의적 체험활동' 찾기
-        for s in self.summary:
-            lbl = (s.get("label") or "")
-            if "창의" in lbl or "창체" in lbl:
-                return s.get("이수학점") or s.get("운영학점")
-        return None
-
-    def _sem_total(self) -> Dict[str, float]:
-        totals = {sl: 0.0 for sl in self.sem_labels}
-        for s in self.subjects:
-            for sl in self.sem_labels:
-                totals[sl] += (s.get(sl) or 0)
-        return totals
-
     # ---------- A. 학점 총량 ----------
-    def check_A1_total(self):
-        subj = self._subjects_credit()
-        ca = self._ca_credit() or 0
-        total = subj + ca
-        st = STATUS_PASS if total >= 192 else STATUS_FAIL
-        self._add("A1", "총 이수학점 192학점 이상",
-                  st, f"교과 {subj:.0f} + 창체 {ca:.0f} = {total:.0f}학점")
+    def check_A1(self):
+        total = self._total_subject_credits() + self._ca_credits()
+        ok = total >= 192
+        self._add("A1", "총 이수학점 192 이상",
+                  "PASS" if ok else "FAIL",
+                  f"총 {total:.0f}학점 (교과 {self._total_subject_credits():.0f} + 창체 {self._ca_credits():.0f})")
 
-    def check_A2_subject_total(self):
-        subj = self._subjects_credit()
-        st = STATUS_PASS if subj >= 174 else STATUS_CHECK
-        self._add("A2", "교과 174학점 이상", st, f"교과 합계 {subj:.0f}학점")
+    def check_A2(self):
+        total = self._total_subject_credits()
+        ok = total >= 174
+        self._add("A2", "교과 174학점 이상",
+                  "PASS" if ok else "FAIL", f"교과 총 {total:.0f}학점")
 
-    def check_A3_required(self):
-        req = sum((s.get("필수이수학점") or 0) for s in self.summary)
-        if req == 0:
-            # 학교지정 합산으로 추정
-            req = sum((s.get("운영학점") or 0) for s in self.subjects
-                      if (s.get("구분") or "").strip() == "학교지정")
-        st = STATUS_PASS if req >= 84 else STATUS_CHECK
-        self._add("A3", "필수 이수학점 84학점 이상",
-                  st, f"필수/학교지정 합계 약 {req:.0f}학점")
+    def check_A3(self):
+        req = self._required_credits()
+        ok = req >= 84
+        self._add("A3", "필수 이수 84학점 이상",
+                  "PASS" if ok else "CHECK", f"필수 합계 {req:.0f}학점")
 
-    def check_A4_ca(self):
-        ca = self._ca_credit()
-        if ca is None:
-            self._add("A4", "창의적 체험활동 18학점", STATUS_NA, "창체 행을 찾지 못함")
-            return
-        st = STATUS_PASS if ca >= 18 else STATUS_FAIL
-        self._add("A4", "창의적 체험활동 18학점", st, f"창체 {ca:.0f}학점")
+    def check_A4(self):
+        ca = self._ca_credits()
+        ok = ca >= 18
+        self._add("A4", "창체 18학점 이상",
+                  "PASS" if ok else "FAIL", f"창체 {ca:.0f}학점")
 
-    def check_A5_excess(self):
-        subj = self._subjects_credit()
-        excess = subj - 174
-        st = STATUS_PASS if excess <= 18 else STATUS_CHECK
-        self._add("A5", "초과 이수학점 적정",
-                  st, f"교과 초과 {excess:+.0f}학점 (174 기준)")
+    def check_A5(self):
+        total = self._total_subject_credits()
+        excess = total - 174
+        if excess <= 0:
+            status, msg = "PASS", "초과 이수 없음"
+        elif excess <= 18:
+            status, msg = "PASS", f"교과 초과 {excess:.0f}학점 (적정)"
+        else:
+            status, msg = "CHECK", f"교과 초과 {excess:.0f}학점 (과다 여부 확인 필요)"
+        self._add("A5", "초과이수 적정성", status, msg)
 
     # ---------- B. 학기별 배분 ----------
-    def check_B1_semester_balance(self):
-        tot = self._sem_total()
-        vals = list(tot.values())
-        diff = max(vals) - min(vals) if vals else 0
-        st = STATUS_PASS if diff <= 5 else STATUS_CHECK
-        detail = " / ".join(f"{k}:{v:.0f}" for k, v in tot.items())
-        self._add("B1", "학기간 학점 차이 5학점 이내",
-                  st, f"차이 {diff:.0f}학점 ({detail})")
+    def check_B1(self):
+        totals = self._semester_totals()
+        if not totals:
+            self._add("B1", "학기간 균형 (차이 5학점 이내)", "N/A", "학기 데이터 없음")
+            return
+        mx, mn = max(totals.values()), min(totals.values())
+        diff = mx - mn
+        ok = diff <= 5
+        detail = " / ".join(f"{k}: {v:.0f}" for k, v in sorted(totals.items()))
+        self._add("B1", "학기간 균형 (차이 5학점 이내)",
+                  "PASS" if ok else "CHECK",
+                  f"최대-최소 차이 {diff:.0f}학점", detail)
 
-    def check_B2_semester_unit(self):
-        # 한 과목이 여러 학기에 분산되지 않는지 (단순 체크)
-        multi = []
+    def check_B2(self):
+        # 한 과목이 여러 학기에 걸쳐 동시 운영되지 않는지 (학기 단위 이수)
+        ok_count = 0
+        warn = []
         for s in self.subjects:
-            count = sum(1 for sl in self.sem_labels if (s.get(sl) or 0) > 0)
-            if count > 1:
-                multi.append(s["과목명"])
-        st = STATUS_PASS if not multi else STATUS_CHECK
-        self._add("B2", "학기 단위 과목 이수",
-                  st, f"복수학기 편성 과목 {len(multi)}개" + (f": {', '.join(multi[:3])}..." if multi else ""))
+            sem = {k: v for k, v in s.get("학기별학점", {}).items() if v > 0}
+            if len(sem) == 0:
+                continue
+            ok_count += 1
+            # 동일 과목이 3개 이상 학기에 분산되면 경고
+            if len(sem) >= 3:
+                warn.append(f"{s['과목명']}({','.join(sem.keys())})")
+        if not warn:
+            self._add("B2", "학기 단위 이수", "PASS", f"{ok_count}개 과목 정상")
+        else:
+            self._add("B2", "학기 단위 이수", "CHECK",
+                      f"{len(warn)}개 과목 다학기 분산", "; ".join(warn[:5]))
 
-    def check_B3_ca_balance(self):
-        self._add("B3", "창체 편중 없음", STATUS_MANUAL,
-                  "창체 학년별 분배는 학교 자체 확인 필요")
+    def check_B3(self):
+        # 창체 편중 (수동 확인 필요)
+        self._add("B3", "창체 학년/학기 편중 여부", "MANUAL",
+                  "엑셀 비고/유의사항 및 학사일정 확인 필요")
 
     # ---------- C. 과목별 학점 ----------
-    def check_C1_credit_range(self):
+    def check_C1(self):
         violations = []
         for s in self.subjects:
-            name = normalize_name(s["과목명"])
-            db = lookup(name)
-            op = s.get("운영학점")
-            if db is None or op is None:
+            info = SUBJECT_DB.get(s["과목명"])
+            if not info:
                 continue
-            _, _, mn, mx, _ = db
-            if op < mn or op > mx:
-                violations.append(f"{name}({op:.0f}, 허용 {mn}-{mx})")
-        st = STATUS_PASS if not violations else STATUS_CHECK
-        detail = f"위반 {len(violations)}건" + (f": {'; '.join(violations[:5])}" if violations else "")
-        self._add("C1", "과목별 학점 증감 범위 (±1/체예교 ±2)", st, detail)
+            grp, typ, base, delta = info
+            op = s.get("운영학점", 0)
+            if op == 0:
+                continue
+            # 학기당 학점은 학기별 분포로 판단
+            sem_vals = [v for v in s.get("학기별학점", {}).values() if v > 0]
+            for v in sem_vals:
+                lo, hi = base - delta, base + delta
+                if typ == T_SPECIAL:
+                    lo, hi = 1, base + delta
+                if v < lo or v > hi:
+                    violations.append(f"{s['과목명']}({v:.0f}학점/학기)")
+                    break
+        if not violations:
+            self._add("C1", "과목별 학점 증감 범위 (±1, 체·예 ±2)", "PASS",
+                      f"DB 매칭 {len([1 for s in self.subjects if s['과목명'] in SUBJECT_DB])}개 모두 적정")
+        else:
+            self._add("C1", "과목별 학점 증감 범위 (±1, 체·예 ±2)", "CHECK",
+                      f"{len(violations)}건 범위 초과 가능",
+                      "; ".join(violations[:8]))
 
-    def check_C2_korean_history(self):
-        targets = {"한국사1": None, "한국사2": None}
-        for s in self.subjects:
-            n = normalize_name(s["과목명"])
-            if n in targets:
-                targets[n] = s.get("운영학점")
-        ok = all(v == 3 for v in targets.values())
-        st = STATUS_PASS if ok else STATUS_FAIL
-        self._add("C2", "한국사1·2 각 3학점",
-                  st, f"한국사1={targets['한국사1']}, 한국사2={targets['한국사2']}")
+    def check_C2(self):
+        h1 = next((s for s in self.subjects if s["과목명"] == "한국사1"), None)
+        h2 = next((s for s in self.subjects if s["과목명"] == "한국사2"), None)
+        if not h1 or not h2:
+            self._add("C2", "한국사 각 3학점", "N/A", "한국사1/2 없음")
+            return
+        ok = h1["운영학점"] == 3 and h2["운영학점"] == 3
+        self._add("C2", "한국사 각 3학점",
+                  "PASS" if ok else "FAIL",
+                  f"한국사1={h1['운영학점']:.0f}, 한국사2={h2['운영학점']:.0f}")
 
-    def check_C3_same_subject(self):
-        # 같은 과목명이 서로 다른 학점으로 편성된 경우
-        from collections import defaultdict
-        m = defaultdict(set)
+    def check_C3(self):
+        # 동일 과목명이 서로 다른 학점으로 편성되지 않았는지
+        name_credits = defaultdict(set)
         for s in self.subjects:
-            n = normalize_name(s["과목명"])
-            if s.get("운영학점"):
-                m[n].add(s["운영학점"])
-        dups = {k: v for k, v in m.items() if len(v) > 1}
-        st = STATUS_PASS if not dups else STATUS_FAIL
-        self._add("C3", "동일 과목 동일 학점",
-                  st, f"불일치 {len(dups)}건" + (f": {dups}" if dups else ""))
+            name_credits[s["과목명"]].add(s.get("운영학점", 0))
+        diff = [(n, sorted(c)) for n, c in name_credits.items() if len(c) > 1]
+        if not diff:
+            self._add("C3", "동일 과목 동일 학점", "PASS", "중복 학점 편성 없음")
+        else:
+            self._add("C3", "동일 과목 동일 학점", "FAIL",
+                      f"{len(diff)}건 불일치",
+                      "; ".join(f"{n}={c}" for n, c in diff[:5]))
 
     # ---------- D. 교과군별 ----------
-    def check_D1_basic_subjects(self):
-        # 국·수·영 합계
-        basic = ["국어", "수학", "영어"]
-        total = 0
-        for s in self.subjects:
-            db = lookup(s["과목명"])
-            tg = db[0] if db else (s.get("교과군") or "")
-            tg_norm = str(tg).replace(" ", "")
-            if tg_norm in [b.replace(" ", "") for b in basic]:
-                total += (s.get("운영학점") or 0)
-        st = STATUS_CHECK if total > 81 else STATUS_PASS
-        self._add("D1", "기초교과(국·수·영) 81학점 이하",
-                  st, f"국·수·영 합계 {total:.0f}학점 (선택풀 포함; 학생당 실 이수는 별도 확인)")
+    def check_D1(self):
+        gt = self._group_totals()
+        basic = sum(gt.get(g, 0) for g in BASIC_GROUPS)
+        total = self._total_subject_credits()
+        ratio = (basic / total * 100) if total else 0
+        ok = basic <= 81
+        msg = f"국·수·영 {basic:.0f}학점 (교과의 {ratio:.1f}%)"
+        self._add("D1", "국·수·영 81학점 이내",
+                  "PASS" if ok else "CHECK", msg,
+                  f"국어 {gt.get(G_KOR, 0):.0f} / 수학 {gt.get(G_MAT, 0):.0f} / 영어 {gt.get(G_ENG, 0):.0f}")
 
-    def check_D2_physical(self):
-        pe_total = 0
-        pe_sems = set()
+    def check_D2(self):
+        gt = self._group_totals()
+        pe = gt.get(G_PE, 0)
+        # 매 학기 편성 여부
+        pe_sems = defaultdict(float)
         for s in self.subjects:
-            db = lookup(s["과목명"])
-            tg = db[0] if db else (s.get("교과군") or "")
-            if "체육" in str(tg):
-                pe_total += (s.get("운영학점") or 0)
-                for sl in self.sem_labels:
-                    if (s.get(sl) or 0) > 0:
-                        pe_sems.add(sl)
-        cond1 = pe_total >= 10
-        cond2 = len(pe_sems) >= 6
-        st = STATUS_PASS if cond1 and cond2 else STATUS_CHECK
+            info = SUBJECT_DB.get(s["과목명"])
+            if not (info and info[0] == G_PE):
+                continue
+            for lbl, v in s.get("학기별학점", {}).items():
+                if v > 0:
+                    pe_sems[lbl] += v
+        n_sem = len(pe_sems)
+        ok = pe >= 10 and n_sem >= len(self.semester_labels)
+        msg = f"체육 {pe:.0f}학점 / {n_sem}개 학기 편성"
         self._add("D2", "체육 10학점 이상 + 매 학기 편성",
-                  st, f"체육 {pe_total:.0f}학점, {len(pe_sems)}개 학기 편성")
+                  "PASS" if ok else "CHECK", msg)
 
     # ---------- E. 순서/위계 ----------
-    def check_E1_common_first(self):
+    def check_E1(self):
+        # 공통 과목이 해당 교과(군)의 선택 과목보다 먼저 편성되었는지
+        first_sem = {}  # (과목명) -> 첫 학기 라벨
+        for s in self.subjects:
+            for lbl, v in s.get("학기별학점", {}).items():
+                if v > 0:
+                    if s["과목명"] not in first_sem or lbl < first_sem[s["과목명"]]:
+                        first_sem[s["과목명"]] = lbl
         violations = []
         for s in self.subjects:
-            n = normalize_name(s["과목명"])
-            db = lookup(n)
-            if not db:
+            info = SUBJECT_DB.get(s["과목명"])
+            if not info:
                 continue
-            stype = db[1]
-            if stype != "공통":
+            grp, typ, *_ = info
+            if typ != T_COMMON:
                 continue
-            # 1학년 1학기/2학기에 편성되어야 정상
-            first_sem = None
-            for sl in self.sem_labels:
-                if (s.get(sl) or 0) > 0:
-                    first_sem = sl
-                    break
-            if first_sem and not first_sem.startswith("1"):
-                violations.append(f"{n}({first_sem})")
-        st = STATUS_PASS if not violations else STATUS_CHECK
-        self._add("E1", "공통과목 → 선택과목 순서",
-                  st, f"위반 {len(violations)}건" + (f": {', '.join(violations[:5])}" if violations else ""))
+            cm_first = first_sem.get(s["과목명"])
+            if not cm_first:
+                continue
+            # 같은 교과군 선택 과목의 첫 학기
+            for s2 in self.subjects:
+                info2 = SUBJECT_DB.get(s2["과목명"])
+                if not info2 or info2[0] != grp:
+                    continue
+                if info2[1] == T_COMMON:
+                    continue
+                sel_first = first_sem.get(s2["과목명"])
+                if sel_first and sel_first < cm_first:
+                    violations.append(f"{s2['과목명']}({sel_first})<{s['과목명']}({cm_first})")
+        if not violations:
+            self._add("E1", "공통→선택 순서", "PASS", "모든 공통 과목이 선택 과목보다 먼저 편성")
+        else:
+            self._add("E1", "공통→선택 순서", "CHECK",
+                      f"{len(violations)}건 역순 가능",
+                      "; ".join(violations[:5]))
 
-    def check_E2_hierarchy(self):
-        # 위계쌍에서 후속이 선수보다 먼저 편성되었는지
-        sem_order = {sl: i for i, sl in enumerate(self.sem_labels)}
-        smap = {}
+    def check_E2(self):
+        first_sem = {}
         for s in self.subjects:
-            n = normalize_name(s["과목명"])
-            for sl in self.sem_labels:
-                if (s.get(sl) or 0) > 0:
-                    smap.setdefault(n, []).append(sl)
+            for lbl, v in sorted(s.get("학기별학점", {}).items()):
+                if v > 0:
+                    first_sem.setdefault(s["과목명"], lbl)
         violations = []
-        for pre, post in HIERARCHY_PAIRS:
-            if pre in smap and post in smap:
-                pre_min = min(sem_order[sl] for sl in smap[pre])
-                post_min = min(sem_order[sl] for sl in smap[post])
-                if post_min < pre_min:
-                    violations.append(f"{pre}→{post}")
-        st = STATUS_PASS if not violations else STATUS_FAIL
-        self._add("E2", "위계 과목 선후 순서",
-                  st, f"위반 {len(violations)}건" + (f": {', '.join(violations)}" if violations else ""))
+        for prev, nxt in HIERARCHY_PAIRS:
+            p, n = first_sem.get(prev), first_sem.get(nxt)
+            if p and n and n < p:
+                violations.append(f"{prev}({p}) > {nxt}({n})")
+        if not violations:
+            self._add("E2", "위계 과목 선후 순서", "PASS",
+                      f"{len([1 for p, n in HIERARCHY_PAIRS if first_sem.get(p) and first_sem.get(n)])}쌍 정상")
+        else:
+            self._add("E2", "위계 과목 선후 순서", "FAIL",
+                      f"{len(violations)}쌍 역순", "; ".join(violations[:5]))
 
     # ---------- F. 과목명/형식 ----------
-    def check_F1_subject_names(self):
+    def check_F1(self):
         unknown = []
         for s in self.subjects:
-            n = normalize_name(s["과목명"])
-            if not n:
+            nm = s["과목명"]
+            if not nm:
                 continue
-            if lookup(n) is None:
-                unknown.append(n)
-        st = STATUS_PASS if not unknown else STATUS_CHECK
-        sample = ", ".join(unknown[:6])
-        self._add("F1", "2022 개정 정식 과목명 사용",
-                  st, f"DB 미일치 {len(unknown)}건" + (f": {sample}" if unknown else ""))
+            if nm not in SUBJECT_DB:
+                unknown.append(nm)
+        if not unknown:
+            self._add("F1", "2022 개정 정식 과목명 사용", "PASS", "전 과목 정식 명칭")
+        else:
+            self._add("F1", "2022 개정 정식 과목명 사용", "CHECK",
+                      f"{len(unknown)}개 과목 DB 미일치 (학교 신설/오타 확인)",
+                      "; ".join(unknown[:8]))
 
-    def check_F2_version(self):
-        title = (self.meta.get("title") or "") + " ".join(self.meta.get("raw_header", []))
-        st = STATUS_PASS if "2022" in title else STATUS_CHECK
-        self._add("F2", "2022 개정 교육과정 명시", st, f"제목: {self.meta.get('title') or '-'}")
+    def check_F2(self):
+        cm = self.parsed.get("col_map", {})
+        if "교과영역" in cm or "교과군" in cm:
+            self._add("F2", "학점배당표 기록 형식 (영역·교과군 컬럼)", "PASS",
+                      "필수 컬럼 모두 존재")
+        else:
+            self._add("F2", "학점배당표 기록 형식 (영역·교과군 컬럼)", "FAIL",
+                      "교과영역/교과군 컬럼 누락")
 
-    def check_F3_format(self):
-        self._add("F3", "학점 배당표 기록 형식 준수", STATUS_MANUAL,
-                  "선택 과목 표기/학기당 과목 수 표기는 셀 서식 확인 필요")
+    def check_F3(self):
+        self._add("F3", "기록 형식 세부 (선택 표기, 학기당 과목수)", "MANUAL",
+                  "엑셀 비고/하단 유의사항 수동 확인 필요")
 
-    # ---------- G. 정성적 ----------
-    def check_G1_choice(self):
-        elective_credits = sum((s.get("운영학점") or 0) for s in self.subjects
-                               if (s.get("구분") or "").strip() not in ["학교지정", ""])
-        st = STATUS_CHECK
-        self._add("G1", "학생 과목 선택권 보장", st,
-                  f"선택과목 운영학점 합계 약 {elective_credits:.0f}학점")
+    # ---------- G. 정성/수동 ----------
+    def check_G1(self):
+        # 학생 선택권: 진로/융합 선택 비율
+        gen = car = conv = 0
+        for s in self.subjects:
+            info = SUBJECT_DB.get(s["과목명"])
+            if not info:
+                continue
+            t = info[1]
+            op = s.get("운영학점", 0)
+            if t == T_GENERAL: gen += op
+            elif t == T_CAREER: car += op
+            elif t == T_CONVERGENCE: conv += op
+        total_sel = gen + car + conv
+        msg = f"일반 {gen:.0f} / 진로 {car:.0f} / 융합 {conv:.0f} (계 {total_sel:.0f})"
+        if total_sel >= 80:
+            self._add("G1", "학생 선택권 보장", "PASS", msg)
+        else:
+            self._add("G1", "학생 선택권 보장", "CHECK", msg)
 
-    def check_G2_common_all(self):
-        # 공통과목 운영학점 합산
-        common_total = sum((s.get("운영학점") or 0) for s in self.subjects
-                          if (lookup(s["과목명"]) or (None, None,))[1] == "공통")
-        self._add("G2", "공통과목 전원 이수",
-                  STATUS_PASS if common_total > 0 else STATUS_CHECK,
-                  f"공통과목 합계 {common_total:.0f}학점")
+    def check_G2(self):
+        # 공통 과목 전원 이수: 공통과목으로 등록된 모든 과목이 운영학점>0
+        missing = []
+        # DB에서 공통 과목 중 일반고에 일반적인 것들
+        common_must = ["공통국어1", "공통국어2", "공통수학1", "공통수학2",
+                       "공통영어1", "공통영어2", "통합사회1", "통합사회2",
+                       "통합과학1", "통합과학2", "한국사1", "한국사2"]
+        names = {s["과목명"] for s in self.subjects if s.get("운영학점", 0) > 0}
+        for c in common_must:
+            if c not in names:
+                missing.append(c)
+        if not missing:
+            self._add("G2", "공통 과목 전원 이수", "PASS",
+                      f"공통 12과목 모두 편성")
+        else:
+            self._add("G2", "공통 과목 전원 이수", "CHECK",
+                      f"{len(missing)}개 누락",
+                      "; ".join(missing))
 
-    def check_G3_religion(self):
-        religion = [s for s in self.subjects if "종교" in str(s.get("과목명") or "")]
-        if not religion:
-            self._add("G3", "종교 과목 복수 편성", STATUS_NA, "종교 과목 미편성")
-            return
-        self._add("G3", "종교 과목 복수 편성", STATUS_MANUAL,
-                  f"종교 과목 {len(religion)}개 편성, 복수 선택 가능 여부 확인")
+    def check_G3(self):
+        rel = [s for s in self.subjects if "종교" in (s["과목명"] or "")]
+        if not rel:
+            self._add("G3", "종교 과목 복수 편성", "N/A", "종교 과목 미편성")
+        else:
+            self._add("G3", "종교 과목 복수 편성", "MANUAL",
+                      f"종교 관련 {len(rel)}개 편성 - 복수선택 보장 여부 수동 확인")
 
     # ---------- 실행 ----------
-    def run_all(self) -> List[Dict[str, Any]]:
-        self.results = []
-        for m in [
-            self.check_A1_total, self.check_A2_subject_total, self.check_A3_required,
-            self.check_A4_ca, self.check_A5_excess,
-            self.check_B1_semester_balance, self.check_B2_semester_unit, self.check_B3_ca_balance,
-            self.check_C1_credit_range, self.check_C2_korean_history, self.check_C3_same_subject,
-            self.check_D1_basic_subjects, self.check_D2_physical,
-            self.check_E1_common_first, self.check_E2_hierarchy,
-            self.check_F1_subject_names, self.check_F2_version, self.check_F3_format,
-            self.check_G1_choice, self.check_G2_common_all, self.check_G3_religion,
-        ]:
+    def run_all(self) -> list[dict]:
+        self._results = []
+        for m in [self.check_A1, self.check_A2, self.check_A3, self.check_A4, self.check_A5,
+                  self.check_B1, self.check_B2, self.check_B3,
+                  self.check_C1, self.check_C2, self.check_C3,
+                  self.check_D1, self.check_D2,
+                  self.check_E1, self.check_E2,
+                  self.check_F1, self.check_F2, self.check_F3,
+                  self.check_G1, self.check_G2, self.check_G3]:
             try:
                 m()
             except Exception as e:
-                self._add("ERR", m.__name__, STATUS_NA, f"점검 실패: {e}")
-        return self.results
+                self._add(m.__name__.replace("check_", ""), m.__name__, "ERROR", f"{type(e).__name__}: {e}")
+        return self._results
+
+
+def run_checks(parsed: dict) -> list[dict]:
+    return CurriculumChecker(parsed).run_all()
