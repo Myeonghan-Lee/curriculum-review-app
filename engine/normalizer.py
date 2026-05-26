@@ -26,7 +26,6 @@ SEMESTER_COLUMNS = {
 def normalize_curriculum(df):
 
     df = df.fillna("")
-
     header_row = None
 
     for idx, row in df.iterrows():
@@ -41,9 +40,7 @@ def normalize_curriculum(df):
         raise Exception("헤더 행을 찾을 수 없습니다")
 
     df.columns = df.iloc[header_row]
-
     df = df[header_row + 1:]
-
     normalized_rows = []
 
     for _, row in df.iterrows():
