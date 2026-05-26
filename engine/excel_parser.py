@@ -9,9 +9,7 @@ def fill_merged_cells(ws):
     for merged_range in merged_ranges:
 
         min_col, min_row, max_col, max_row = merged_range.bounds
-
         value = ws.cell(min_row, min_col).value
-
         ws.unmerge_cells(str(merged_range))
 
         for row in range(min_row, max_row + 1):
@@ -21,15 +19,10 @@ def fill_merged_cells(ws):
 
 
 def load_curriculum_excel(file):
-
     wb = load_workbook(file)
-
     ws = wb.active
-
     fill_merged_cells(ws)
-
     data = ws.values
-
     df = pd.DataFrame(data)
 
     return df
