@@ -19,26 +19,17 @@ uploaded_file = st.file_uploader(
 )
 
 if uploaded_file:
-
     st.success("파일 업로드 완료")
-
     with st.spinner("엑셀 분석 중..."):
-
         raw_df = load_curriculum_excel(uploaded_file)
-
         normalized_df = normalize_curriculum(raw_df)
-
         validation_result = validate_curriculum(normalized_df)
-
         manual_review = extract_manual_review(normalized_df)
-
     st.subheader("정규화 데이터")
     st.dataframe(normalized_df)
-
     st.subheader("자동 검토 결과")
 
     for item in validation_result:
-
         if item["status"] == "ERROR":
             st.error(item["message"])
 
