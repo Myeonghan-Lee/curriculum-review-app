@@ -1,377 +1,422 @@
+# -*- coding: utf-8 -*-
 """
-parser.py - 2022 개정 교육과정 학점배당표 엑셀 파서 (v3)
+parser.py — 교육과정 학점 배당표 엑셀 파서 (v4)
 
-주요 개선:
-- 헤더 키워드 정규화 (줄바꿈/공백/번호 접두사 제거 후 매칭)
-- 헤더 탐지를 다단계로 수행 (엄격 → 완화 → 부분문자열)
-- 2행/3행 병합 헤더 모두 자동 인식
-- 학년/학기 컬럼을 위치 기반으로도 추정 (보조 로직)
+v4 개선사항:
+  - 다중 시트 워크북에서 헤더 키워드 점수가 가장 높은 시트를 자동 선택
+  - 헤더 탐지 범위를 30행으로 확장하고 정규화 매칭으로 강건성 향상
+  - 번호접두사("1)과목"), 줄바꿈("기준\n학점"), 특수문자("교과(군)") 모두 인식
+  - 시트별 진단 점수를 오류 메시지에 포함하여 디버깅 용이
+
+출력 인터페이스 (기존 v3와 호환):
+  {
+    "meta":             {"school": str, "year": int, "version": str},
+    "subjects":         [{"구분", "교과군", "과목유형", "과목명",
+                          "기준학점", "운영학점",
+                          "1-1", "1-2", "2-1", "2-2", "3-1", "3-2",
+                          "학기합", "비고", "_row"}],
+    "summary":          [{"label", "구분", "운영학점", "이수학점",
+                          "필수이수학점", "1-1"...}],
+    "notes":            [str],
+    "semester_labels":  ["1-1", "1-2", "2-1", "2-2", "3-1", "3-2"],
+    "col_map":          {역할: 컬럼번호},
+    "diagnostics":      {"selected_sheet", "sheet_scores", "header_range", "data_range"},
+  }
 """
-import re
+
+from __future__ import annotations
 import io
-import copy
-from typing import Optional, Dict, List, Any, Tuple
-import openpyxl
-from openpyxl.utils import get_column_letter
-import pandas as pd
-import numpy as np
+import re
+from typing import Dict, List, Tuple, Any
+from openpyxl import load_workbook
+from openpyxl.worksheet.worksheet import Worksheet
 
 
-def _norm(v) -> str:
-    """셀 값을 비교 가능한 형태로 정규화."""
+# ---------- 정규화 ----------
+
+def _norm(v: Any) -> str:
+    """매칭용 정규형: 공백/줄바꿈/번호접두사/특수문자 제거."""
     if v is None:
         return ""
     s = str(v)
-    # 줄바꿈/탭/공백을 모두 제거
     s = re.sub(r"\s+", "", s)
-    # "1)", "2.", "①" 등 접두사 제거
     s = re.sub(r"^[\(\[]?\d+[\)\]\.]\s*", "", s)
-    s = re.sub(r"^[①-⑳]", "", s)
+    s = s.replace("·", "").replace("∙", "").replace("・", "")
     return s
 
 
-def _unmerge_and_fill(ws) -> None:
-    """병합셀을 해제하고 좌상단 값을 전체 영역에 복사."""
-    merged = [str(r) for r in ws.merged_cells.ranges]
-    for rng in merged:
-        ws.unmerge_cells(rng)
-    for rng in merged:
-        # rng 형식: "A1:C2"
-        m = re.match(r"([A-Z]+)(\d+):([A-Z]+)(\d+)", rng)
-        if not m:
-            continue
-        from openpyxl.utils import column_index_from_string
-        c1 = column_index_from_string(m.group(1))
-        r1 = int(m.group(2))
-        c2 = column_index_from_string(m.group(3))
-        r2 = int(m.group(4))
-        v = ws.cell(r1, c1).value
-        for r in range(r1, r2 + 1):
-            for c in range(c1, c2 + 1):
-                if r == r1 and c == c1:
-                    continue
-                ws.cell(r, c).value = v
-
-
-# 헤더 키워드 (정규화 후 비교)
-HEADER_KEYS = {
+HEADER_KEYWORDS = {
     "구분": ["구분"],
-    "교과군": ["교과군", "교과", "교과(군)"],
-    "과목유형": ["과목유형"],
-    "과목명": ["과목", "과목명"],
+    "교과군": ["교과군", "교과(군)", "교과"],
+    "과목유형": ["과목유형", "과목구분", "유형"],
+    "과목명": ["과목명", "과목"],
     "기준학점": ["기준학점"],
-    "운영학점": ["운영학점"],
-    "학년1": ["1학년"],
-    "학년2": ["2학년"],
-    "학년3": ["3학년"],
+    "운영학점": ["운영학점", "이수단위", "단위"],
     "비고": ["비고"],
     "이수학점": ["이수학점"],
-    "필수이수학점": ["필수이수학점"],
+    "필수이수학점": ["필수이수학점", "필수학점"],
+    "학년": ["학년"],
+    "학기": ["학기"],
 }
 
 
-def _find_header_row(ws) -> Tuple[int, int]:
-    """
-    헤더 행 위치를 찾는다.
-    반환: (header_start_row, header_end_row)  - 1-based
-    """
-    max_scan = min(ws.max_row, 20)
-    best_row = -1
-    best_score = 0
-    for r in range(1, max_scan + 1):
-        row_norm = [_norm(ws.cell(r, c).value) for c in range(1, ws.max_column + 1)]
-        score = 0
-        for key_list in HEADER_KEYS.values():
-            for k in key_list:
-                if any(k in cell for cell in row_norm if cell):
-                    score += 1
+def _score_header_row(ws: Worksheet, row: int) -> int:
+    """특정 행이 헤더일 가능성 점수 (매칭된 고유 키 개수)."""
+    matched = set()
+    for col in range(1, ws.max_column + 1):
+        v = _norm(ws.cell(row, col).value)
+        if not v:
+            continue
+        for key, kws in HEADER_KEYWORDS.items():
+            if key in matched:
+                continue
+            for kw in kws:
+                if kw == v or (len(kw) >= 2 and kw in v):
+                    matched.add(key)
                     break
-        if score > best_score:
-            best_score = score
+    return len(matched)
+
+
+def _select_best_sheet(wb) -> Tuple[Worksheet, Dict[str, int]]:
+    """모든 시트를 스캔하여 헤더 점수가 가장 높은 시트 선택.
+
+    Returns: (선택된 워크시트, {시트명: 최고점수} 진단정보)
+    """
+    diag: Dict[str, int] = {}
+    best_ws, best_score = None, -1
+    for sn in wb.sheetnames:
+        ws = wb[sn]
+        max_row = min(30, ws.max_row)
+        sheet_best = 0
+        for r in range(1, max_row + 1):
+            s = _score_header_row(ws, r)
+            if s > sheet_best:
+                sheet_best = s
+        diag[sn] = sheet_best
+        if sheet_best > best_score:
+            best_score = sheet_best
+            best_ws = ws
+    return best_ws, diag
+
+
+def _find_header_row(ws: Worksheet, scan_rows: int = 30) -> Tuple[int, int]:
+    """헤더 시작행과 끝행 자동 탐지. 실패 시 (-1, -1)."""
+    max_row = min(scan_rows, ws.max_row)
+    best_row, best_score = -1, -1
+    for r in range(1, max_row + 1):
+        s = _score_header_row(ws, r)
+        if s > best_score:
+            best_score = s
             best_row = r
-    if best_row < 0 or best_score < 4:
-        raise ValueError(
-            f"헤더 행을 찾지 못했습니다. (최고 점수={best_score}, 행={best_row}) "
-            f"엑셀 상단 20행 안에 '구분/교과/과목/학점/학년' 키워드가 충분히 들어있는지 확인하세요."
-        )
-    # 헤더 다음 행에 '1학기/2학기'가 있으면 2행 헤더
-    next_row_norm = [_norm(ws.cell(best_row + 1, c).value) for c in range(1, ws.max_column + 1)]
-    has_semester = any("학기" in cell for cell in next_row_norm if cell)
-    if has_semester:
-        return best_row, best_row + 1
-    return best_row, best_row
+    if best_score < 3:
+        return -1, -1
+    # 다음 1~2행이 학기 행이면 헤더 끝 확장
+    end = best_row
+    for r in range(best_row + 1, min(best_row + 3, ws.max_row + 1)):
+        row_text = " ".join(_norm(ws.cell(r, c).value) for c in range(1, ws.max_column + 1))
+        if "학기" in row_text and ("1학기" in row_text or "2학기" in row_text):
+            end = r
+        else:
+            break
+    return best_row, end
 
 
-def _build_column_map(ws, h_start: int, h_end: int) -> Dict[str, int]:
-    """헤더 행을 읽어 컬럼 인덱스(1-based) 매핑을 만든다."""
-    col_map: Dict[str, int] = {}
-    semester_cols: List[Tuple[int, str]] = []  # (col, '1-1' 등)
+# ---------- 병합 셀 처리 ----------
 
-    # 컬럼별 정규화 값 수집
-    col_norm: Dict[int, str] = {}
-    for c in range(1, ws.max_column + 1):
-        col_norm[c] = _norm(ws.cell(h_start, c).value)
-
-    # 우선순위가 높은 키부터 매핑 (긴 키, 더 구체적인 키 먼저)
-    priority_order = [
-        "필수이수학점", "이수학점", "기준학점", "운영학점",
-        "과목유형", "과목명",
-        "교과군", "구분", "비고",
-    ]
-    used_cols = set()
-
-    for key in priority_order:
-        variants = HEADER_KEYS.get(key, [])
-        for c in range(1, ws.max_column + 1):
-            if c in used_cols:
-                continue
-            top = col_norm[c]
-            if not top:
-                continue
-            matched = False
-            for v in variants:
-                vn = _norm(v)
-                if not vn:
-                    continue
-                # 정확 일치 또는 짧은 변형 일치
-                if vn == top:
-                    matched = True
-                    break
-                # '과목명'을 찾을 때 '과목유형'은 배제
-                if key == "과목명" and "과목유형" in top:
-                    continue
-                # '교과군'을 찾을 때 '교과(군)' 같은 변형 허용 (4자 이내)
-                if vn in top and len(top) <= len(vn) + 3:
-                    matched = True
-                    break
-            if matched:
-                col_map[key] = c
-                used_cols.add(c)
-                break
-
-    # 2단계: 학년+학기 결합
-    for c in range(1, ws.max_column + 1):
-        top = col_norm[c]
-        sub = _norm(ws.cell(h_end, c).value) if h_end > h_start else ""
-        if "1학년" in top:
-            if "1학기" in sub:
-                semester_cols.append((c, "1-1"))
-            elif "2학기" in sub:
-                semester_cols.append((c, "1-2"))
-        elif "2학년" in top:
-            if "1학기" in sub:
-                semester_cols.append((c, "2-1"))
-            elif "2학기" in sub:
-                semester_cols.append((c, "2-2"))
-        elif "3학년" in top:
-            if "1학기" in sub:
-                semester_cols.append((c, "3-1"))
-            elif "2학기" in sub:
-                semester_cols.append((c, "3-2"))
-
-    # 보조 로직: 헤더 행에 '1학년/2학년/3학년'만 있고 하위 학기가 비어있는 경우
-    # 인접 컬럼 2개씩 묶어 1학기/2학기로 추정
-    if len(semester_cols) < 6:
-        semester_cols = []
-        grade_cols = []
-        for c in range(1, ws.max_column + 1):
-            top = _norm(ws.cell(h_start, c).value)
-            if "1학년" in top:
-                grade_cols.append((c, 1))
-            elif "2학년" in top:
-                grade_cols.append((c, 2))
-            elif "3학년" in top:
-                grade_cols.append((c, 3))
-        # 같은 학년이 2칸이면 1학기/2학기로 분배
-        from collections import defaultdict
-        g2c = defaultdict(list)
-        for c, g in grade_cols:
-            g2c[g].append(c)
-        for g, cols in g2c.items():
-            cols = sorted(cols)
-            if len(cols) >= 2:
-                semester_cols.append((cols[0], f"{g}-1"))
-                semester_cols.append((cols[1], f"{g}-2"))
-            elif len(cols) == 1:
-                semester_cols.append((cols[0], f"{g}-1"))
-
-    for c, label in semester_cols:
-        col_map[label] = c
-
-    return col_map
+def _unmerge_and_fill(ws: Worksheet) -> None:
+    """병합 셀을 해제하고 좌상단 값을 모든 셀에 복사."""
+    for mr in list(ws.merged_cells.ranges):
+        min_col, min_row, max_col, max_row = mr.bounds
+        top_value = ws.cell(min_row, min_col).value
+        ws.unmerge_cells(str(mr))
+        for r in range(min_row, max_row + 1):
+            for c in range(min_col, max_col + 1):
+                ws.cell(r, c).value = top_value
 
 
-def _extract_metadata(ws) -> Dict[str, Any]:
-    """상단 1~2행에서 학교명, 학년도 등을 추출."""
-    meta = {"school": None, "year": None, "title": None, "raw_header": []}
-    for r in range(1, 4):
+# ---------- 메타데이터 ----------
+
+def _extract_metadata(ws: Worksheet, header_start_row: int) -> Dict[str, Any]:
+    meta = {"school": None, "year": None, "version": None}
+    for r in range(1, header_start_row):
         for c in range(1, ws.max_column + 1):
             v = ws.cell(r, c).value
-            if v and isinstance(v, str):
-                meta["raw_header"].append(v)
-                # 학교명
-                if "학교" in v and meta["school"] is None:
-                    m = re.search(r"([가-힣A-Za-z0-9]+(?:고등학교|중학교|학교))", v)
-                    if m:
-                        meta["school"] = m.group(1)
-                # 학년도
-                if "학년도" in v and meta["year"] is None:
-                    m = re.search(r"(\d{4})\s*학년도", v)
-                    if m:
-                        meta["year"] = int(m.group(1))
-                if meta["title"] is None and ("배당표" in v or "교육과정" in v):
-                    meta["title"] = v
+            if not v:
+                continue
+            s = str(v)
+            if "고등학교" in s and meta["school"] is None:
+                m = re.search(r"([가-힣]+(?:여자고등학교|남자고등학교|고등학교))", s)
+                if m:
+                    meta["school"] = m.group(1)
+            m_year = re.search(r"(20\d{2})학년도", s)
+            if m_year and meta["year"] is None:
+                meta["year"] = int(m_year.group(1))
+            if "2022 개정" in s or "2022개정" in s:
+                meta["version"] = "2022 개정"
+            elif "2015 개정" in s and meta["version"] is None:
+                meta["version"] = "2015 개정"
     return meta
 
 
-def _detect_summary_keywords() -> List[str]:
-    return [
-        "합계", "소계", "총계", "교과 합계", "교과합계",
-        "창의적 체험활동", "창의적체험활동", "창체",
-        "총 이수", "총이수", "필수 이수", "필수이수",
-        "학기당", "학기 당", "과목 수", "과목수",
-        "이수학점", "이수 학점",
+# ---------- 컬럼 매핑 ----------
+
+def _build_col_map(ws: Worksheet, hs: int, he: int) -> Tuple[Dict[str, int], List[str]]:
+    """헤더 영역을 분석해 {역할: 컬럼번호} 매핑과 학기 라벨 목록 생성."""
+    col_map: Dict[str, int] = {}
+    used: set = set()
+    n_cols = ws.max_column
+
+    # (1) 단일 행 매핑: 긴 키워드 우선
+    priority = [
+        ("필수이수학점", ["필수이수학점", "필수학점"]),
+        ("이수학점", ["이수학점"]),
+        ("기준학점", ["기준학점"]),
+        ("운영학점", ["운영학점", "이수단위", "단위"]),
+        ("과목유형", ["과목유형", "과목구분"]),
+        ("과목명", ["과목명", "과목"]),
+        ("교과군", ["교과군", "교과(군)", "교과"]),
+        ("구분", ["구분"]),
+        ("비고", ["비고"]),
     ]
+    for key, kws in priority:
+        if key in col_map:
+            continue
+        for r in range(hs, he + 1):
+            for c in range(1, n_cols + 1):
+                if c in used:
+                    continue
+                v = _norm(ws.cell(r, c).value)
+                if not v:
+                    continue
+                if key == "과목명" and "유형" in v:
+                    continue
+                if key == "교과군" and ("유형" in v or "명" in v):
+                    continue
+                for kw in kws:
+                    if kw == v or (len(kw) >= 2 and kw in v):
+                        col_map[key] = c
+                        used.add(c)
+                        break
+                if key in col_map:
+                    break
+            if key in col_map:
+                break
+
+    # (2) 학년-학기 매핑
+    semester_labels: List[str] = []
+    if he > hs:
+        for c in range(1, n_cols + 1):
+            top = _norm(ws.cell(hs, c).value)
+            bot = _norm(ws.cell(he, c).value)
+            m_grade = re.search(r"([1-3])학년", top)
+            m_sem = re.search(r"([1-2])학기", bot)
+            if m_grade and m_sem:
+                label = f"{m_grade.group(1)}-{m_sem.group(1)}"
+                col_map[label] = c
+                if label not in semester_labels:
+                    semester_labels.append(label)
+    else:
+        cur_grade = None
+        for c in range(1, n_cols + 1):
+            v = _norm(ws.cell(hs, c).value)
+            mg = re.search(r"([1-3])학년", v)
+            ms = re.search(r"([1-2])학기", v)
+            if mg and ms:
+                label = f"{mg.group(1)}-{ms.group(1)}"
+                col_map[label] = c
+                semester_labels.append(label)
+            elif mg:
+                cur_grade = mg.group(1)
+            elif ms and cur_grade:
+                label = f"{cur_grade}-{ms.group(1)}"
+                col_map[label] = c
+                semester_labels.append(label)
+
+    semester_labels.sort()
+    return col_map, semester_labels
 
 
-def _is_summary_row(row_text: str) -> bool:
-    norm = _norm(row_text)
-    for kw in _detect_summary_keywords():
-        if _norm(kw) in norm:
-            return True
-    return False
+# ---------- 데이터 추출 ----------
+
+SUMMARY_KEYWORDS = ["합계", "소계", "창의적", "체험활동", "총 이수", "총이수",
+                    "유의사항", "학기당", "이수 과목 수", "이수과목수"]
 
 
-def _to_num(v) -> Optional[float]:
-    if v is None:
-        return None
-    if isinstance(v, (int, float)) and not isinstance(v, bool):
+def _is_summary_row(ws: Worksheet, row: int, n_cols: int) -> bool:
+    row_text = " ".join(str(ws.cell(row, c).value or "") for c in range(1, n_cols + 1))
+    return any(k in row_text for k in SUMMARY_KEYWORDS)
+
+
+def _to_float(v: Any) -> float:
+    if v is None or v == "":
+        return 0.0
+    if isinstance(v, (int, float)):
         return float(v)
-    if isinstance(v, str):
-        s = v.strip()
-        if not s:
-            return None
-        # "12(택4)" 같은 경우 12만 추출
-        m = re.match(r"\s*(\d+(?:\.\d+)?)", s)
-        if m:
-            try:
-                return float(m.group(1))
-            except Exception:
-                return None
-    return None
+    s = re.sub(r"[^\d\.]", "", str(v).strip())
+    try:
+        return float(s) if s else 0.0
+    except ValueError:
+        return 0.0
 
 
-def parse_excel(source) -> Dict[str, Any]:
-    """
-    엑셀 파일을 파싱해 정형화된 dict로 반환.
-    source: 파일 경로 또는 BytesIO
-    반환 키:
-      - meta: 학교명, 학년도 등
-      - col_map: 헤더 컬럼 매핑
-      - subjects: 과목별 데이터 (list of dict)
-      - summary: 하단 요약 행 (list of dict)
-      - notes: 유의사항 텍스트 (list of str)
-      - dataframe: pandas DataFrame
-    """
-    wb = openpyxl.load_workbook(source, data_only=True)
-    # 시트 선택: 이름에 '입학' 또는 '학점' 포함된 시트 우선, 없으면 첫번째
-    ws = None
-    for sn in wb.sheetnames:
-        if any(k in sn for k in ["입학", "학점", "배당"]):
-            ws = wb[sn]
-            break
-    if ws is None:
-        ws = wb[wb.sheetnames[0]]
-
-    # 병합셀 해제
-    _unmerge_and_fill(ws)
-
-    # 메타데이터
-    meta = _extract_metadata(ws)
-    meta["sheet_name"] = ws.title
-
-    # 헤더 탐지
-    h_start, h_end = _find_header_row(ws)
-    col_map = _build_column_map(ws, h_start, h_end)
-
-    # 필수 컬럼 확인 (과목명 또는 운영학점 중 최소 하나)
-    if "과목명" not in col_map and "운영학점" not in col_map:
-        raise ValueError(
-            f"필수 컬럼(과목명/운영학점)을 찾지 못했습니다. 헤더 매핑: {col_map}"
-        )
-
-    sem_labels = [f"{g}-{s}" for g in (1, 2, 3) for s in (1, 2)]
-
+def _extract_subjects(ws: Worksheet, data_start: int, data_end: int,
+                       col_map: Dict[str, int], semester_labels: List[str]) -> List[Dict[str, Any]]:
     subjects: List[Dict[str, Any]] = []
-    summary: List[Dict[str, Any]] = []
-    notes: List[str] = []
+    n_cols = ws.max_column
 
-    data_start = h_end + 1
-    for r in range(data_start, ws.max_row + 1):
-        row_vals = {c: ws.cell(r, c).value for c in range(1, ws.max_column + 1)}
-        # 행 전체가 비어있으면 스킵
-        if all(v is None or (isinstance(v, str) and not v.strip()) for v in row_vals.values()):
+    for r in range(data_start, data_end + 1):
+        if _is_summary_row(ws, r, n_cols):
             continue
-
-        # 행 텍스트로 요약/유의사항 판별
-        joined = " ".join(str(v) for v in row_vals.values() if v is not None)
-        norm_joined = _norm(joined)
-
-        # 유의사항 (긴 텍스트, 한 셀에 문장)
-        if ("유의사항" in joined or "유의 사항" in joined or
-            (len(joined) > 60 and "학점" in joined and "과목" not in joined[:20])):
-            notes.append(joined.strip())
+        name_col = col_map.get("과목명")
+        if not name_col:
             continue
-
-        # 과목명 셀 추출
-        sname = None
-        if "과목명" in col_map:
-            sname = ws.cell(r, col_map["과목명"]).value
-            sname = sname.strip() if isinstance(sname, str) else sname
-
-        # 요약 행
-        is_summary = False
-        first_two = " ".join(str(row_vals.get(c, "")) for c in [1, 2, 3, 4] if row_vals.get(c))
-        if _is_summary_row(first_two) or _is_summary_row(joined[:80]):
-            is_summary = True
-        # 과목명이 비어있고 운영학점/이수학점이 있으면 요약
-        if not sname:
-            op = _to_num(ws.cell(r, col_map["운영학점"]).value) if "운영학점" in col_map else None
-            tot = _to_num(ws.cell(r, col_map["이수학점"]).value) if "이수학점" in col_map else None
-            sem_sum = sum((_to_num(ws.cell(r, col_map[s]).value) or 0) for s in sem_labels if s in col_map)
-            if (op or tot or sem_sum) and any(_to_num(v) for v in row_vals.values()):
-                is_summary = True
+        name_val = ws.cell(r, name_col).value
+        if not name_val or not str(name_val).strip():
+            continue
 
         rec: Dict[str, Any] = {
-            "row": r,
+            "_row": r,
             "구분": ws.cell(r, col_map["구분"]).value if "구분" in col_map else None,
             "교과군": ws.cell(r, col_map["교과군"]).value if "교과군" in col_map else None,
             "과목유형": ws.cell(r, col_map["과목유형"]).value if "과목유형" in col_map else None,
-            "과목명": sname,
-            "기준학점": _to_num(ws.cell(r, col_map["기준학점"]).value) if "기준학점" in col_map else None,
-            "운영학점": _to_num(ws.cell(r, col_map["운영학점"]).value) if "운영학점" in col_map else None,
+            "과목명": str(name_val).strip(),
+            "기준학점": _to_float(ws.cell(r, col_map["기준학점"]).value) if "기준학점" in col_map else 0.0,
+            "운영학점": _to_float(ws.cell(r, col_map["운영학점"]).value) if "운영학점" in col_map else 0.0,
             "비고": ws.cell(r, col_map["비고"]).value if "비고" in col_map else None,
-            "이수학점": _to_num(ws.cell(r, col_map["이수학점"]).value) if "이수학점" in col_map else None,
-            "필수이수학점": _to_num(ws.cell(r, col_map["필수이수학점"]).value) if "필수이수학점" in col_map else None,
         }
-        for sl in sem_labels:
-            rec[sl] = _to_num(ws.cell(r, col_map[sl]).value) if sl in col_map else None
-        rec["학기합"] = sum((rec[sl] or 0) for sl in sem_labels)
 
-        if is_summary:
-            rec["label"] = (sname or first_two or "").strip()
-            summary.append(rec)
-        elif sname:
-            subjects.append(rec)
+        total = 0.0
+        for label in semester_labels:
+            if label in col_map:
+                val = _to_float(ws.cell(r, col_map[label]).value)
+                rec[label] = val
+                total += val
+            else:
+                rec[label] = 0.0
+        rec["학기합"] = total
+        if rec["운영학점"] == 0.0 and total > 0:
+            rec["운영학점"] = total
 
-    df = pd.DataFrame(subjects)
+        # 비고는 문자열 정리
+        if rec["비고"] is not None:
+            rec["비고"] = str(rec["비고"]).strip() or None
+
+        subjects.append(rec)
+    return subjects
+
+
+def _extract_summary(ws: Worksheet, data_end: int, col_map: Dict[str, int],
+                      semester_labels: List[str]) -> List[Dict[str, Any]]:
+    """요약 행(소계/합계/창체/총이수/학기당) 추출."""
+    rows: List[Dict[str, Any]] = []
+    n_cols = ws.max_column
+
+    for r in range(data_end + 1, ws.max_row + 1):
+        text = " ".join(str(ws.cell(r, c).value or "") for c in range(1, n_cols + 1)).strip()
+        if not text:
+            continue
+        if not any(k in text for k in SUMMARY_KEYWORDS):
+            continue
+
+        # label 결정
+        label_parts = []
+        for c in range(1, min(n_cols + 1, 6)):
+            v = ws.cell(r, c).value
+            if v is not None and str(v).strip():
+                sv = str(v).strip()
+                if any(k in sv for k in SUMMARY_KEYWORDS) or sv in ("소계", "합계"):
+                    label_parts.append(sv)
+        label = " ".join(label_parts) if label_parts else text[:30]
+
+        rec: Dict[str, Any] = {
+            "_row": r,
+            "label": label,
+            "구분": ws.cell(r, col_map["구분"]).value if "구분" in col_map else None,
+            "교과군": ws.cell(r, col_map["교과군"]).value if "교과군" in col_map else None,
+            "운영학점": _to_float(ws.cell(r, col_map["운영학점"]).value) if "운영학점" in col_map else 0.0,
+            "이수학점": _to_float(ws.cell(r, col_map["이수학점"]).value) if "이수학점" in col_map else 0.0,
+            "필수이수학점": _to_float(ws.cell(r, col_map["필수이수학점"]).value) if "필수이수학점" in col_map else 0.0,
+        }
+        for label_s in semester_labels:
+            rec[label_s] = _to_float(ws.cell(r, col_map[label_s]).value) if label_s in col_map else 0.0
+        rows.append(rec)
+    return rows
+
+
+def _extract_notes(ws: Worksheet) -> List[str]:
+    """유의사항/비고 텍스트 블록 추출."""
+    notes: List[str] = []
+    seen = set()
+    for r in range(1, ws.max_row + 1):
+        for c in range(1, ws.max_column + 1):
+            v = ws.cell(r, c).value
+            if not v:
+                continue
+            s = str(v).strip()
+            if len(s) < 6:
+                continue
+            if ("유의사항" in s or s.startswith("※") or s.startswith("*") or
+                "교차이수" in s or "공동교육과정" in s):
+                if s not in seen:
+                    seen.add(s)
+                    notes.append(s)
+    return notes
+
+
+# ---------- 메인 ----------
+
+def parse_excel(source) -> Dict[str, Any]:
+    """엑셀 파일을 파싱해 구조화된 결과 반환.
+
+    Args:
+        source: 파일 경로(str) 또는 BytesIO 객체.
+    """
+    wb = load_workbook(source, data_only=True)
+
+    # 헤더 점수가 가장 높은 시트 자동 선택
+    ws, sheet_scores = _select_best_sheet(wb)
+    if ws is None:
+        raise ValueError("워크북에 시트가 없습니다.")
+
+    _unmerge_and_fill(ws)
+
+    hs, he = _find_header_row(ws)
+    if hs < 0:
+        diag = ", ".join(f"{k}={v}" for k, v in sheet_scores.items())
+        raise ValueError(
+            f"헤더 행을 찾지 못했습니다.\n"
+            f"  선택 시트: {ws.title}\n"
+            f"  시트별 최고 점수: {diag}\n"
+            f"  엑셀 상단 30행 안에 '구분/교과/과목/학점/학년' 등 "
+            f"헤더 키워드가 3개 이상 포함되어야 합니다."
+        )
+
+    meta = _extract_metadata(ws, hs)
+    col_map, semester_labels = _build_col_map(ws, hs, he)
+
+    # 데이터 영역 결정
+    data_start = he + 1
+    data_end = ws.max_row
+    for r in range(data_start, ws.max_row + 1):
+        if _is_summary_row(ws, r, ws.max_column):
+            data_end = r - 1
+            break
+
+    subjects = _extract_subjects(ws, data_start, data_end, col_map, semester_labels)
+    summary = _extract_summary(ws, data_end, col_map, semester_labels)
+    notes = _extract_notes(ws)
 
     return {
         "meta": meta,
-        "col_map": col_map,
         "subjects": subjects,
         "summary": summary,
         "notes": notes,
-        "dataframe": df,
-        "semester_labels": sem_labels,
+        "semester_labels": semester_labels,
+        "col_map": col_map,
+        "diagnostics": {
+            "selected_sheet": ws.title,
+            "sheet_scores": sheet_scores,
+            "header_range": (hs, he),
+            "data_range": (data_start, data_end),
+        },
     }
