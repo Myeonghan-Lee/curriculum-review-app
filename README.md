@@ -1,83 +1,43 @@
-# 고교 교육과정 편성 자율점검 도구
+# 교육과정 편성 자율점검 (Streamlit)
 
-2022 개정 교육과정 기준 고등학교 학점 배당표(.xlsx)를 자동 분석하여 **21개 점검항목**에 대해 PASS/FAIL/CHECK 결과를 제공하는 Streamlit 웹앱입니다.
+2022 개정 교육과정 학점 배당표(.xlsx)를 업로드하면 **자율점검표 21개 항목**을 자동 검토합니다.
 
 ## 주요 기능
+- 병합셀 자동 해제 및 3행 헤더 자동 인식
+- 과목명/유형/학점 추출 + 학기별 배당 학점 자동 계산
+- 2022 개정 145개 과목 DB 기반 위계·학점·표기 검증
+- 비고 및 하단 유의사항 자동 추출 (수동 점검 지원)
 
-- 엑셀 학점 배당표 자동 파싱 (병합셀 해제 + 동적 헤더/경계 탐지)
-- 21개 점검항목 자동 검증
-  - **A. 학점 총량**: 총 192학점, 필수 84학점, 창체 18학점
-  - **B. 학기별 배분**: 학기간 균형
-  - **C. 과목별 학점**: 증감범위, 한국사 6학점, 동일과목 동일학점
-  - **D. 교과군별**: 국·수·영 ≤ 50%, 체육 매학기·10학점 이상
-  - **E. 순서/위계**: 공통→선택, 위계 과목 선후행
-  - **F. 과목명/형식**: 2022 개정 공식 명칭 일치
-  - **G. 정성/수동**: 선택권, 종교 복수편성
-- 비고/유의사항 자동 추출 (수동 점검 지원)
-- 결과 CSV/Excel 다운로드
-
-## 빠른 시작 (로컬)
-
+## 로컬 실행
 ```bash
-git clone https://github.com/YOUR_ID/curriculum-checker.git
-cd curriculum-checker
 pip install -r requirements.txt
 streamlit run app.py
 ```
 
-브라우저에서 `http://localhost:8501` 로 접속합니다.
-
 ## Streamlit Cloud 배포
-
-1. 이 저장소를 GitHub Public 저장소로 push
+1. 이 폴더를 GitHub 저장소(Public)에 push
 2. [share.streamlit.io](https://share.streamlit.io) 접속 → GitHub 연동
-3. 저장소 선택 → `app.py` 지정 → Deploy
-4. 발급된 `https://[your-app].streamlit.app` URL 공유
+3. **New app** → 저장소 선택 → `app.py` 지정 → Deploy
+4. push 시 자동 재배포
 
-## 프로젝트 구조
+## 파일 구성
+| 파일 | 역할 |
+|------|------|
+| `app.py` | Streamlit UI |
+| `parser.py` | 엑셀 파싱 (병합셀 해제·동적 헤더 탐지) |
+| `checker.py` | 21개 점검 로직 |
+| `db.py` | 2022 개정 과목 DB |
 
-```
-curriculum-checker/
-├── app.py              # Streamlit UI
-├── parser.py           # 엑셀 파싱
-├── checker.py          # 21개 점검 로직
-├── db.py               # 국가 교육과정 DB (151+ 과목)
-├── requirements.txt
-├── README.md
-├── .gitignore
-└── .streamlit/
-    └── config.toml     # 테마 설정
-```
-
-## 점검 기준 출처
-
-- **2022 개정 교육과정 총론** (교육부 고시)
-- **고등학교 교육과정 편성·운영 기준**
-- **교육과정 편성 자율점검표** (시도교육청)
-
-## 라이선스
-
-MIT License
-
-## 면책 조항
-
-본 도구는 자동 점검 보조 도구이며, 최종 교육과정 확정은 학교 교육과정위원회의 검토가 필요합니다.
-
+## 지원하는 헤더 형식
+- 표준 키워드: `구분`, `교과(군)`, `과목유형`, `과목명/과목`, `기준학점`, `운영학점`, `1~3학년(1·2학기)`, `비고`, `이수학점`, `필수이수학점`
+- 키워드에 `1)`, `2)` 같은 번호 접두사 또는 `\n` 줄바꿈이 있어도 정규화 후 매칭
 
 ## 트러블슈팅
+| 증상 | 원인 / 해결 |
+|------|-------------|
+| `AttributeError: 'Styler' object has no attribute 'applymap'` | pandas 2.1+에서 `applymap` → `map`. requirements.txt의 pandas 버전 확인 |
+| `ValueError: 헤더 행을 찾지 못했습니다` | 엑셀 상단 20행 내 헤더 키워드가 5개 미만. 시트 구조/병합 상태를 확인 |
+| 과목명이 `공통`, `일반`으로 잘못 추출됨 | `과목유형` 컬럼과 매칭 충돌. parser.py 최신 버전(우선순위 매칭)으로 교체 |
 
-### `AttributeError: 'Styler' object has no attribute 'applymap'`
-pandas 2.1+ 버전에서 `Styler.applymap`이 `Styler.map`으로 변경되었습니다.
-본 패키지의 `app.py`는 두 API를 모두 지원하도록 자동 분기 처리되어 있습니다.
-구버전 코드를 사용 중이라면 다음과 같이 변경하세요:
-
-```python
-# 변경 전 (deprecated)
-df.style.applymap(func, subset=["상태"])
-
-# 변경 후
-df.style.map(func, subset=["상태"])
-```
-
-### Streamlit Cloud 재배포가 적용되지 않을 때
-`Manage app` → `Reboot app` 클릭 또는 `requirements.txt`에 빈 줄을 추가 후 push하면 강제 재빌드됩니다.
+## 라이선스
+MIT
