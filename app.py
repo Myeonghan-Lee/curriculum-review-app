@@ -1,28 +1,57 @@
 import streamlit as st
 import pandas as pd
+import re
 
-# --- [1] 페이지 설정 ---
 st.set_page_config(page_title="교육과정 편제표 검토기", layout="wide")
 st.title("🏫 교육과정 편제표 자동 검토 시스템")
-st.markdown("학교에서 제출한 편제표 엑셀 파일을 업로드하면, 국가 교육과정 지침에 따른 위반 사항을 자동으로 검출합니다.")
 
-# --- [2] 데이터 전처리 함수 ---
+# --- [새로 추가된 핵심 로직: 유연한 엑셀 읽기 함수] ---
+def load_excel_robustly(file):
+    # 1. 파일의 첫 15줄을 읽어 '구분'이나 '교과'라는 단어가 있는 진짜 헤더 행 찾기
+    temp_df = pd.read_excel(file, header=None, nrows=15)
+    header_idx = 0
+    for i in range(len(temp_df)):
+        row_values = temp_df.iloc[i].astype(str).tolist()
+        if any('구분' in val for val in row_values) or any('교과' in val for val in row_values):
+            header_idx = i
+            break
+            
+    # 2. 찾은 헤더 행을 기준으로 다시 제대로 읽기
+    df = pd.read_excel(file, header=header_idx)
+    
+    # 3. 컬럼명 정규화 (띄어쓰기, 괄호 등 특수문자 모두 제거)
+    # 예: '교과(군)' -> '교과군', '과목 유형' -> '과목유형'
+    df.columns = [re.sub(r'[\s\(\)]', '', str(col)) for col in df.columns]
+    
+    # 4. '과목' 컬럼을 '과목명'으로 통일 (학교마다 다를 수 있으므로)
+    if '과목' in df.columns and '과목명' not in df.columns:
+        df.rename(columns={'과목': '과목명'}, inplace=True)
+        
+    return df
+
+# --- [전처리 함수 수정 (정규화된 컬럼명 기준)] ---
 def preprocess_curriculum(df):
-    # 1. 병합된 셀(결측치) 앞의 값으로 채우기
-    df[['구분', '교과군', '과목유형']] = df[['구분', '교과군', '과목유형']].ffill()
+    # 필수로 있어야 할 컬럼 확인 및 ffill
+    core_cols = ['구분', '교과군', '과목유형']
+    existing_cols = [col for col in core_cols if col in df.columns]
     
-    # 2. 롱 폼(Long form)으로 변환 (Melt)
-    # 실제 엑셀 파일의 열 이름에 맞게 수정이 필요할 수 있습니다.
+    if existing_cols:
+        df[existing_cols] = df[existing_cols].ffill()
+    else:
+        st.error(f"엑셀 파일에서 기본 열({core_cols})을 찾을 수 없습니다. 현재 인식된 열: {list(df.columns)}")
+        st.stop() # 실행 중단
+        
     id_vars = ['구분', '교과군', '과목유형', '과목명', '기본학점']
-    # 엑셀에 비고나 개설유형이 있다면 id_vars에 추가합니다.
-    if '비고' in df.columns: id_vars.append('비고')
-    if '과목 개설 유형' in df.columns: id_vars.append('과목 개설 유형')
-
-    value_vars = ['1-1', '1-2', '2-1', '2-2', '3-1', '3-2']
     
-    # 존재하는 학기 열만 value_vars로 사용
-    value_vars = [col for col in value_vars if col in df.columns]
+    # 비고나 개설유형 열이 정규화된 이름으로 존재하는지 확인 후 추가
+    for extra in ['과목개설유형', '비고']:
+        if extra in df.columns: 
+            id_vars.append(extra)
 
+    # 1학기, 2학기 값 찾기 (1-1, 1-2 또는 1학기, 2학기 등)
+    # 여기서는 제출하신 엑셀의 열 이름을 유연하게 잡기 위해 숫자와 '-'가 포함된 열을 찾습니다.
+    value_vars = [col for col in df.columns if '-' in str(col) or '학기' in str(col)]
+    
     df_melted = df.melt(
         id_vars=id_vars,
         value_vars=value_vars,
@@ -30,70 +59,53 @@ def preprocess_curriculum(df):
         value_name='배정학점'
     )
     
-    # 3. 배정학점이 없는(결측치이거나 0인) 행 제거 (수강하지 않는 학기)
     df_cleaned = df_melted.dropna(subset=['배정학점'])
-    # 학점이 숫자인 경우 0 이상만 남기기
     df_cleaned['배정학점'] = pd.to_numeric(df_cleaned['배정학점'], errors='coerce')
     df_cleaned = df_cleaned[df_cleaned['배정학점'] > 0]
     
     return df_cleaned
 
-# --- [3] 검증 로직 함수 ---
+# --- [검증 로직 함수 (동일)] ---
 def validate_curriculum(df):
     results = []
     
-    # 1. 총 이수 학점 검증 (교과 174학점 이상)
     total_credits = df['배정학점'].sum()
     if total_credits >= 174:
         results.append(("✅ 통과", f"교과 총 이수 학점: {total_credits}학점 (174학점 이상 충족)"))
     else:
         results.append(("❌ 오류", f"교과 총 이수 학점 부족: {total_credits}학점 (174학점 이상 편성 필요)"))
 
-    # 2. 국·수·영 이수 학점 총합 검증 (81학점 초과 금지)
     kme_credits = df[df['교과군'].isin(['국어', '수학', '영어'])]['배정학점'].sum()
     if kme_credits <= 81:
         results.append(("✅ 통과", f"국·수·영 총합: {kme_credits}학점 (81학점 이하 충족)"))
     else:
         results.append(("❌ 오류", f"국·수·영 총합 초과: {kme_credits}학점 (81학점 초과 금지)"))
 
-    # 3. 체육 교과 연속성 검증 (매 학기 편성)
-    pe_data = df[df['교과군'] == '체육']
+    pe_data = df[df['교과군'].isin(['체육'])]
     pe_semesters = pe_data['개설학기'].unique()
-    if len(pe_semesters) == 6:
-        results.append(("✅ 통과", "체육 교과 매 학기(6개 학기) 편성 충족"))
+    if len(pe_semesters) >= 6:
+        results.append(("✅ 통과", "체육 교과 매 학기 편성 충족"))
     else:
-        missing = set(['1-1', '1-2', '2-1', '2-2', '3-1', '3-2']) - set(pe_semesters)
-        results.append(("❌ 오류", f"체육 교과 누락 학기 발생: {', '.join(missing)}"))
+        results.append(("❌ 오류", f"체육 교과 누락 학기 발생 (현재 {len(pe_semesters)}개 학기 편성)"))
         
     return results
 
-# --- [4] 메인 UI 구성 ---
-uploaded_file = st.file_uploader("교육과정 편제표 엑셀 파일을 업로드하세요 (.xlsx)", type=['xlsx'])
+# --- [메인 UI] ---
+uploaded_file = st.file_uploader("교육과정 편제표 엑셀 파일을 업로드하세요 (.xlsx)", type=['xlsx', 'xls'])
 
 if uploaded_file is not None:
-    try:
-        # 데이터 읽기 (header 위치는 엑셀 양식에 따라 조정 필요)
-        raw_df = pd.read_excel(uploaded_file, header=0)
+    # try-except로 감싸서 에러 추적을 쉽게 만듦
+    # try:
+    raw_df = load_excel_robustly(uploaded_file)
+    
+    st.subheader("1. 원본 데이터 헤더 인식 결과")
+    st.write("인식된 컬럼명:", list(raw_df.columns))
+    st.dataframe(raw_df.head(5))
+    
+    with st.spinner('데이터를 정제하고 검증하는 중입니다...'):
+        clean_df = preprocess_curriculum(raw_df)
         
-        st.subheader("원본 데이터 미리보기")
-        st.dataframe(raw_df.head(3))
+        st.subheader("2. 구조 변환 완료 (Long Form)")
+        st.dataframe(clean_df)
         
-        with st.spinner('데이터를 정제하고 검증하는 중입니다...'):
-            # 전처리
-            clean_df = preprocess_curriculum(raw_df)
-            
-            st.subheader("구조 변환 완료 (Long Form)")
-            st.dataframe(clean_df)
-            
-            # 검증 수행
-            validation_results = validate_curriculum(clean_df)
-            
-            st.subheader("📊 교육과정 점검 결과")
-            for status, message in validation_results:
-                if status == "✅ 통과":
-                    st.success(f"{status} | {message}")
-                else:
-                    st.error(f"{status} | {message}")
-                    
-    except Exception as e:
-        st.error(f"파일을 처리하는 중 오류가 발생했습니다. 양식을 확인해주세요.\n(에러 내용: {e})")
+        validation_results = validate_curriculum(clean_df)
