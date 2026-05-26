@@ -7,21 +7,36 @@ st.title("🏫 교육과정 편제표 자동 검토 시스템")
 
 # --- [새로 추가된 핵심 로직: 유연한 엑셀 읽기 함수] ---
 def load_excel_robustly(file):
-    # 1. 파일의 첫 15줄을 읽어 '구분'이나 '교과'라는 단어가 있는 진짜 헤더 행 찾기
-    temp_df = pd.read_excel(file, header=None, nrows=15)
-    header_idx = 0
+    import re
+    
+    # 1. 넉넉하게 맨 위 30줄을 읽어옵니다. (header=None으로 읽어 원본 구조 파악)
+    temp_df = pd.read_excel(file, header=None, nrows=30)
+    
+    header_idx = -1 # 헤더를 찾았는지 확인하기 위한 초기값
+    
     for i in range(len(temp_df)):
-        row_values = temp_df.iloc[i].astype(str).tolist()
+        # 셀의 결측치(NaN)를 빈 문자열로 바꾸고, 모든 공백(\s)을 완전히 제거하여 텍스트만 추출합니다.
+        # 예: "구  분", "구\n분" -> "구분"으로 변환하여 검사
+        row_values = [re.sub(r'\s+', '', str(val)) for val in temp_df.iloc[i].fillna('')]
+        
+        # '구분' 또는 '교과'라는 단어가 하나라도 있으면 해당 행을 헤더로 지정
         if any('구분' in val for val in row_values) or any('교과' in val for val in row_values):
             header_idx = i
             break
             
-    # 2. 찾은 헤더 행을 기준으로 다시 제대로 읽기
+    # 🚨 헤더를 못 찾은 경우: 파이썬이 읽은 원본 엑셀 화면을 앱에 직접 띄워서 보여줍니다!
+    if header_idx == -1:
+        import streamlit as st
+        st.error("❌ '구분'이나 '교과'라는 글자가 포함된 헤더 행을 상단 30줄에서 찾을 수 없습니다.")
+        st.write("🔍 [디버깅] 현재 파이썬이 읽어들인 엑셀 상단 10줄 원본 데이터입니다:")
+        st.dataframe(temp_df.head(10).astype(str))
+        st.stop() # 여기서 앱 실행을 즉시 중단합니다.
+        
+    # 2. 찾은 헤더 행을 기준으로 데이터를 다시 제대로 읽습니다.
     df = pd.read_excel(file, header=header_idx)
     
-    # 3. 컬럼명 정규화 (띄어쓰기, 괄호 등 특수문자 모두 제거)
-    # 예: '교과(군)' -> '교과군', '과목 유형' -> '과목유형'
-    df.columns = [re.sub(r'[\s\(\)]', '', str(col)) for col in df.columns]
+    # 3. 컬럼명 정규화 (띄어쓰기, 줄바꿈, 괄호 등 특수문자 모두 제거)
+    df.columns = [re.sub(r'[\s\(\)\n]', '', str(col)) for col in df.columns]
     
     # 4. '과목' 컬럼을 '과목명'으로 통일 (학교마다 다를 수 있으므로)
     if '과목' in df.columns and '과목명' not in df.columns:
