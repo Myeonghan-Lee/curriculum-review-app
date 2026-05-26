@@ -1,22 +1,15 @@
 import pandas as pd
-
         if credit_sum < required_credit:
-
             results.append({
                 "status": "ERROR",
                 "message": f"{group_name} 교과군 학점 부족 ({credit_sum}/{required_credit})"
             })
-
         else:
-
             results.append({
                 "status": "PASS",
                 "message": f"{group_name} 교과군 충족 ({credit_sum}/{required_credit})"
             })
-
     return results
-
-
 
 def validate_pe_semester(df):
 
@@ -58,11 +51,8 @@ def validate_pe_semester(df):
 def validate_curriculum(df):
 
     results = []
-
     results.append(validate_total_credit(df))
-
     results.extend(validate_subject_groups(df))
-
     results.extend(validate_pe_semester(df))
 
     return results
